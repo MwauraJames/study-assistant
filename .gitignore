@@ -9,3 +9,11 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+#storage
+*.sqlite3
+models/
+chroma_db_storage/
+
+#test
+test.*

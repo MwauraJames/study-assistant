@@ -1,15 +1,35 @@
+import os
+from dotenv import load_dotenv
+import chromadb
 from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.retrievers import AutoMergingRetriever
 from llama_index.core.storage.docstore import SimpleDocumentStore
-from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+from llama_index.embeddings.fastembed import FastEmbedEmbedding
 
-embed_model = FastEmbedEmbeddings(model_name="BAAI/bge-large-en-v1.5")
+from ingestion.storage import Storage
+
+
+embed_model = FastEmbedEmbedding(
+    model_name="BAAI/bge-small-en-v1.5",
+    cache_dir="./models",  # see the note below
+)
+
+storage = Storage()
 
 class Chunk:
     def __init__(self):
         pass
     def chunk_documents(self, docs):
+        redis_docstore = storage.redis()
+        vector_store = storage.chroma()
+        
+        storage_context = StorageContext.from_defaults(
+            docstore=redis_docstore,
+            vector_store=vector_store,
+            )
+
+
         # 1. Create a true hierarchical parser
         # Slices documents into 2048 tokens, then 512 tokens, then 128 tokens
         node_parser = HierarchicalNodeParser.from_defaults(
@@ -20,10 +40,9 @@ class Chunk:
         nodes = node_parser.get_nodes_from_documents(docs)
         leaf_nodes = get_leaf_nodes(nodes) 
 
-        # 3. Set up the storage context (linking all parents and children together)
-        docstore = SimpleDocumentStore()
-        docstore.add_documents(nodes)
-        storage_context = StorageContext.from_defaults(docstore=docstore)
+        
+        redis_docstore.add_documents(nodes)
+       
 
         # 4. Build the vector index strictly using the smallest 128-token leaf nodes
         base_index = VectorStoreIndex(
