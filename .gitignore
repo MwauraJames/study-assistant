@@ -17,3 +17,6 @@ chroma_db_storage/
 
 #test
 test.*
+
+#observability
+langfuse/

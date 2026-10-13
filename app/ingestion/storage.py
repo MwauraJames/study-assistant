@@ -1,4 +1,6 @@
+# storage.py
 import chromadb
+
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.storage.docstore.redis import RedisDocumentStore
 
@@ -8,10 +10,11 @@ class Storage:
         chroma_collection = chroma_client.get_or_create_collection("university_nodes")
         return ChromaVectorStore(chroma_collection=chroma_collection)
 
-    def redis(self):
-        # -- Set up Redis for Document Storage (Large Parent Chunks) --
+    def redis(self, namespace: str = "university_app_docs"):
         return RedisDocumentStore.from_host_and_port(
-            host="127.0.0.1", 
-            port=6379, 
-            namespace="university_app_docs"
+            host="127.0.0.1", port=6379, namespace=namespace
         )
+
+
+
+

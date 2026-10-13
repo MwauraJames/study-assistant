@@ -1,26 +1,13 @@
 import os
 from dotenv import load_dotenv
 import chromadb
+from langsmith import traceable
 from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.retrievers import AutoMergingRetriever
-from llama_index.core.storage.docstore import SimpleDocumentStore
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
 
-from ingestion.storage import Storage
-
-
-embed_model = FastEmbedEmbedding(
-    model_name="BAAI/bge-small-en-v1.5",
-    cache_dir="./models",  # see the note below
-)
-
-storage = Storage()
-
-class Chunk:
-    def __init__(self):
-        pass
-    def chunk_documents(self, docs):
+@traceable
+def chunk_documents(storage,embed_model,docs):
         redis_docstore = storage.redis()
         vector_store = storage.chroma()
         
@@ -37,11 +24,15 @@ class Chunk:
         )
 
         # 2. Parse the documents and isolate the smallest chunks (leaves)
-        nodes = node_parser.get_nodes_from_documents(docs)
-        leaf_nodes = get_leaf_nodes(nodes) 
+        parent_nodes = node_parser.get_nodes_from_documents(docs)
+        leaf_nodes = get_leaf_nodes(parent_nodes) 
+
+        leaves_docstore = storage.redis("university_app_leaves")
+        leaves_docstore.add_documents(leaf_nodes)
 
         
-        redis_docstore.add_documents(nodes)
+        redis_docstore.add_documents(parent_nodes)
+        
        
 
         # 4. Build the vector index strictly using the smallest 128-token leaf nodes
