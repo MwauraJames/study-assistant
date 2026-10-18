@@ -14,9 +14,12 @@ wheels/
 *.sqlite3
 models/
 chroma_db_storage/
+bm25_index_storage/
+
 
 #test
 test.*
 
 #observability
 langfuse/
+

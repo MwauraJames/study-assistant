@@ -1,63 +1,70 @@
-# retrieval.py
 from langsmith import traceable
-from llama_index.core import VectorStoreIndex
-from llama_index.core.retrievers import QueryFusionRetriever
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
-from llama_index.retrievers.bm25 import BM25Retriever
-from llama_index.core.schema import NodeWithScore
+from llama_index.core import StorageContext, VectorStoreIndex
 from llama_index.core.llms import MockLLM
+from llama_index.core.retrievers import AutoMergingRetriever, QueryFusionRetriever
+from llama_index.retrievers.bm25 import BM25Retriever
+
+from ingestion.storage import BM25_DIR
+
+TOP_K = 50          # leaves fetched by EACH of dense and BM25, and kept after fusion
+MERGE_RATIO = 0.5   # merge siblings into their parent when MORE than this fraction
+                    # of the parent's children were retrieved (see notes below)
 
 
+def build_hybrid_retriever(storage, embed_model):
+    """
+    Search leaves first, then merge:
+      dense (Chroma) + BM25  ->  RRF fusion (top 50 leaves)
+      ->  auto-merge: leaves that share a parent are replaced by that parent,
+          every other leaf stays as a leaf.
+    """
+    docstore = storage.redis()
+    vector_store = storage.chroma()
 
+    # BM25 raises an error if top_k is larger than the number of indexed leaves
+    # (a short document can have fewer than 50), so cap k at the corpus size.
+    k = max(1, min(TOP_K, storage.chroma_collection().count()))
 
-TOP_K = 50
+    index = VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
+    dense = index.as_retriever(similarity_top_k=k)
 
-def build_hybrid_retriever(storage,embed_model) -> QueryFusionRetriever:
-      # see note below
-    index = VectorStoreIndex.from_vector_store(storage.chroma(), embed_model=embed_model)
+    sparse = BM25Retriever.from_persist_dir(BM25_DIR)
+    sparse.similarity_top_k = k
 
-    dense = index.as_retriever(similarity_top_k=TOP_K)
-    sparse = BM25Retriever.from_defaults(
-        docstore=storage.redis("university_app_leaves"),
-        similarity_top_k=TOP_K,
-    )
-
-    return QueryFusionRetriever(
-
+    fusion = QueryFusionRetriever(
         [dense, sparse],
-        similarity_top_k=TOP_K,
-        llm=MockLLM(),
+        similarity_top_k=k,
+        llm=MockLLM(),            # never called: num_queries=1 means no query rewriting
         num_queries=1,
-        mode="reciprocal_rerank",
+        mode="reciprocal_rerank",  # RRF
         use_async=False,
     )
 
-@traceable(run_type="retriever")
-def expand_to_parents(results, parent_store):
-    seen, expanded = set(), []
-    for r in results:                          # results are sorted best-first
-        parent = r.node.parent_node
-        if parent is None or parent.node_id in seen:
-            continue
-        seen.add(parent.node_id)
-        doc = parent_store.get_document(parent.node_id, raise_error=False)
-        if doc is not None:
-            expanded.append(NodeWithScore(node=doc, score=r.score))
-    return expanded
+    storage_context = StorageContext.from_defaults(
+        docstore=docstore, vector_store=vector_store
+    )
+    return AutoMergingRetriever(
+        fusion, storage_context, simple_ratio_thresh=MERGE_RATIO, verbose=False
+    )
 
-
-def fuse_ranked_lists(result_lists, top_k=TOP_K, k=60):
-    """RRF across several ranked lists (one per query variant)."""
-    scores, nodes = {}, {}
-    for results in result_lists:
-        for rank, r in enumerate(results):
-            nid = r.node.node_id
-            nodes[nid] = r.node
-            scores[nid] = scores.get(nid, 0.0) + 1.0 / (k + rank + 1)
-    ranked = sorted(scores, key=scores.get, reverse=True)[:top_k]
-    return [NodeWithScore(node=nodes[n], score=scores[n]) for n in ranked]
 
 @traceable(run_type="retriever")
-def hybrid_search(retriever, queries, top_k=TOP_K):
-    result_lists = retriever.retrieve(queries)
-    return fuse_ranked_lists(result_lists, top_k=top_k)
+def drop_covered_nodes(results, docstore):
+    """
+    Auto-merging can leave a leaf next to a bigger block that already contains it
+    (e.g. a 2048 block built from some 512 siblings, plus a leaf from another 512
+    sibling inside it). Drop any node whose ancestor is already in the results.
+    """
+    ids = {r.node.node_id for r in results}
+    kept = []
+    for r in results:
+        cur, covered = r.node, False
+        while cur is not None and cur.parent_node is not None:
+            pid = cur.parent_node.node_id
+            if pid in ids:
+                covered = True
+                break
+            cur = docstore.get_document(pid, raise_error=False)
+        if not covered:
+            kept.append(r)
+    return kept
