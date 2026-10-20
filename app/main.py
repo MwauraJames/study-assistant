@@ -20,22 +20,25 @@ from ingestion.reset_store import reset_all
 from retrieval.reranker import rerank_documents
 from retrieval.expand import expand_query
 from retrieval.hybrid_search import build_hybrid_retriever, drop_covered_nodes
-from generation.llm1 import generate_response
 from generation.response import final_response
+from models import model
+from config import Settings
 
-RERANK_TOP_N = 3   # how many blocks go to the LLM (was 1)
 
 
 # ---------- Setup ----------
 app = FastAPI()
 
+settings = Settings()
 storage = Storage()
 embed_model = Embed().get_embedding()
 client = LlamaCloud()
 
-reset_all(storage)   # Redis + Chroma + BM25 together (the Chroma reset used to silently do nothing)
+reset_all(storage) 
+  # Redis + Chroma + BM25 together (the Chroma reset used to silently do nothing)
+RERANK_TOP_N = settings.rerank_top_n
 
-UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR = Path(settings.upload_dir)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 # Tracks the one document: "empty" -> "processing" -> "ready" / "failed"
@@ -76,19 +79,20 @@ def ingest_pipeline(file_path):
 @traceable(name="retrieval_pipeline", run_type="chain")
 def retrieval_pipeline(query):
     # 1. Expand the question (falls back to the original if the LLM fails)
-    expanded_query = expand_query(generate_response, query)
+
+    expanded_query = expand_query(model, query)
 
     # 2. Search 50 leaves (dense + BM25, RRF), then merge sibling leaves into parents
     merged = holder["retriever"].retrieve(expanded_query)
 
-    # 3. Remove blocks that are already contained inside a bigger returned block
+     # 3. Remove blocks that are already contained inside a bigger returned block
     candidates = drop_covered_nodes(merged, storage.redis())
     if not candidates:
-        return ""
+        return ""          
 
     # 4. Rerank ALL candidates against the original question, keep the best few
-    texts = [c.node.get_content() for c in candidates]
-    reranked = rerank_documents(query, texts, "rerank-v4.0-pro", top_n=RERANK_TOP_N)
+    texts = [c.node.get_content() for c in merged]
+    reranked = rerank_documents(query, texts)
 
     best = [texts[r.index] for r in reranked.results]
     return "\n\n---\n\n".join(best)
@@ -100,7 +104,7 @@ def response_pipeline(query):
     if not context:
         return "I couldn't find anything relevant to that in the uploaded document."
     full_message = f"Query: {query}\nSource Documents:\n{context}"
-    return final_response(generate_response, full_message)
+    return final_response(model,full_message)
 
 
 # ---------- Endpoints ----------

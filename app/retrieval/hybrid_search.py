@@ -5,9 +5,11 @@ from llama_index.core.retrievers import AutoMergingRetriever, QueryFusionRetriev
 from llama_index.retrievers.bm25 import BM25Retriever
 
 from ingestion.storage import BM25_DIR
+from config import Settings
+settings = Settings()
 
-TOP_K = 50          # leaves fetched by EACH of dense and BM25, and kept after fusion
-MERGE_RATIO = 0.5   # merge siblings into their parent when MORE than this fraction
+TOP_K = settings.top_k        # leaves fetched by EACH of dense and BM25, and kept after fusion
+MERGE_RATIO = settings.merge_ratio  # merge siblings into their parent when MORE than this fraction
                     # of the parent's children were retrieved (see notes below)
 
 

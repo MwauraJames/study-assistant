@@ -23,3 +23,9 @@ test.*
 #observability
 langfuse/
 
+chunked_content/
+parsed_content/
+uploads/
+qdrant_storage/
+results/
+

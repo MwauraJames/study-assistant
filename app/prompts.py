@@ -4,7 +4,9 @@ QUERY_EXPANSION_PROMPT = (
     "Keep every important word from the original question exactly as written. "
     "You may add a few closely related terms or synonyms, but do not add facts, "
     "assumptions or an answer. "
-    "Return one short query (at most two sentences), with no preamble."
+    "Return one query , with no preamble."
 )
 
-ANSWER_SYSTEM_PROMPT = "You are a helpful assistant that responds to user queries. from the sources provided."
+RESPONSE_SYSTEM_PROMPT = "You are a helpful assistant that responds to user queries. from the sources provided." \
+"if no source is provided say so and do not answer."
+

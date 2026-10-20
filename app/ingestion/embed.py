@@ -1,9 +1,12 @@
 from llama_index.embeddings.fastembed import FastEmbedEmbedding
+from config import Settings
+
+settings = Settings()
 
 
 class Embed:
     def get_embedding(self):
         return FastEmbedEmbedding(
-            model_name="BAAI/bge-small-en-v1.5",
+            model_name=settings.embed_model,
             cache_dir="./models",
         )

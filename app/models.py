@@ -1,21 +1,9 @@
 """Model Initialization File
 
-Configures the LLM model used throughout the course.
-
-Default: Anthropic claude-haiku-4-5 (fast, cheap, great for learning).
+Configures the LLM model.
 
 ═══════════════════════════════════════════════════════════════════════════
   ⚠  IMPORTANT: install the matching extra BEFORE swapping providers
-═══════════════════════════════════════════════════════════════════════════
-
-  Provider              Install command              Already installed?
-  --------------------  ---------------------------  ---------------------
-  Anthropic (default)   -                            yes (default dep)
-  OpenAI                -                            yes (default dep)
-  Azure OpenAI          uv sync --extra azure        no - install first
-  AWS Bedrock           uv sync --extra bedrock      no - install first
-  Google Vertex/Gemini  uv sync --extra google       no - install first
-
 ═══════════════════════════════════════════════════════════════════════════
 
 To swap providers:
@@ -62,7 +50,7 @@ model = init_chat_model("groq:openai/gpt-oss-120b")
 # Install the Ollama app first: https://ollama.com
 # Pull a model first, e.g.:  ollama pull qwen2.5:7b
 #
-# model = init_chat_model("ollama:qwen2.5:7b")
+#model = init_chat_model("ollama:llama3.2:1b")
 
 # Kimi (Moonshot AI): OpenAI-compatible hosted API
 # No extra install needed (langchain-openai is already a default dep)

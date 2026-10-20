@@ -4,11 +4,15 @@ import chromadb
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.storage.docstore.redis import RedisDocumentStore
 
+from config import Settings
+
+settings = Settings()
+
 # One place for every name/path, so ingestion, retrieval and reset can never disagree.
-CHROMA_PATH = "./chroma_db_storage"
-CHROMA_COLLECTION = "university_nodes"
-BM25_DIR = "./bm25_index_storage"
-REDIS_NAMESPACE = "university_app_docs"
+CHROMA_PATH = settings.chroma_path
+CHROMA_COLLECTION = settings.chroma_collection
+BM25_DIR = settings.bm25_dir
+REDIS_NAMESPACE = settings.redis_namespace
 
 
 class Storage:
