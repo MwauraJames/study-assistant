@@ -1,11 +1,12 @@
 import shutil
-import threading
+import uuid
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from llama_index.core import Document
@@ -16,14 +17,13 @@ from ingestion.parse import parse_document
 from ingestion.chunk import chunk_documents
 from ingestion.storage import Storage
 from ingestion.embed import Embed
-from ingestion.reset_store import reset_all
+from ingestion.reset_store import delete_by_doc_id
 from retrieval.reranker import rerank_documents
 from retrieval.expand import expand_query
-from retrieval.hybrid_search import build_hybrid_retriever, drop_covered_nodes
 from generation.response import final_response
 from models import model
+from retrieval.hybrid_search import build_hybrid_retriever, merge_leaves_to_parents
 from config import Settings
-
 
 
 # ---------- Setup ----------
@@ -34,113 +34,139 @@ storage = Storage()
 embed_model = Embed().get_embedding()
 client = LlamaCloud()
 
-reset_all(storage) 
-  # Redis + Chroma + BM25 together (the Chroma reset used to silently do nothing)
-RERANK_TOP_N = settings.rerank_top_n
-
 UPLOAD_DIR = Path(settings.upload_dir)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Tracks the one document: "empty" -> "processing" -> "ready" / "failed"
-state = {"status": "empty", "error": None}
-state_lock = threading.Lock()
-holder = {"retriever": None}   # built once per ingestion, reused by every question
+# Track ingestion status per doc_id instead of blocking the entire server
+doc_statuses: dict[str, dict] = {}
 
 
 class Question(BaseModel):
     query: str
+    user_id: str
+    subject: Optional[str] = None
+    doc_id: Optional[str] = None
 
 
 # ---------- Pipelines ----------
 @traceable(name="ingest_pipeline", run_type="chain")
-def ingest_pipeline(file_path):
+def ingest_pipeline(file_path: str, user_id: str, subject: str, doc_id: str):
     try:
-        holder["retriever"] = None
         parsed_content = parse_document(client, file_path)
 
-        # Only wipe the old document once the new one parsed successfully, then
-        # write all three stores fresh so they always describe the SAME document.
-        reset_all(storage)
-        chunk_documents(storage, embed_model, [Document(text=parsed_content)])
+        # If re-uploading the same doc_id, clear only its old points first
+        delete_by_doc_id(storage, doc_id)
 
-        holder["retriever"] = build_hybrid_retriever(storage, embed_model)
-        state["status"] = "ready"
+        chunk_documents(
+            storage=storage,
+            embed_model=embed_model,
+            docs=[Document(text=parsed_content)],
+            user_id=user_id,
+            subject=subject,
+            doc_id=doc_id,
+        )
+        doc_statuses[doc_id] = {"status": "ready", "error": None}
     except Exception as e:
-        state["status"] = "failed"
-        state["error"] = str(e)
-        holder["retriever"] = None
+        doc_statuses[doc_id] = {"status": "failed", "error": str(e)}
         try:
-            reset_all(storage)   # don't leave half-written stores behind
+            delete_by_doc_id(storage, doc_id)  # Clean up partial writes for this doc_id
         except Exception:
             pass
         raise
 
 
 @traceable(name="retrieval_pipeline", run_type="chain")
-def retrieval_pipeline(query):
-    # 1. Expand the question (falls back to the original if the LLM fails)
-
+def retrieval_pipeline(
+    query: str,
+    user_id: str,
+    subject: Optional[str] = None,
+    doc_id: Optional[str] = None,
+) -> str:
+    # 1. Expand the question
     expanded_query = expand_query(model, query)
 
-    # 2. Search 50 leaves (dense + BM25, RRF), then merge sibling leaves into parents
-    merged = holder["retriever"].retrieve(expanded_query)
+    # 2. Build filtered Qdrant hybrid retriever and retrieve top-k 128-token leaves
+    retriever = build_hybrid_retriever(
+        storage=storage,
+        embed_model=embed_model,
+        user_id=user_id,
+        subject=subject,
+        doc_id=doc_id,
+    )
+    leaf_results = retriever.retrieve(expanded_query)
+    if not leaf_results:
+        return ""
 
-     # 3. Remove blocks that are already contained inside a bigger returned block
-    candidates = drop_covered_nodes(merged, storage.redis())
-    if not candidates:
-        return ""          
+    # 3. Promote leaves to their unique 512-token parent texts from Qdrant payload
+    candidate_texts = merge_leaves_to_parents(leaf_results)
+    if not candidate_texts:
+        return "" 
 
-    # 4. Rerank ALL candidates against the original question, keep the best few
-    texts = [c.node.get_content() for c in merged]
-    reranked = rerank_documents(query, texts)
+    # 4. Rerank unique parent blocks against the original question
+    reranked = rerank_documents(query, candidate_texts)
+    best = [candidate_texts[r.index] for r in reranked.results]
 
-    best = [texts[r.index] for r in reranked.results]
     return "\n\n---\n\n".join(best)
 
 
 @traceable(name="response_pipeline", run_type="chain")
-def response_pipeline(query):
-    context = retrieval_pipeline(query)
+def response_pipeline(body: Question) -> str:
+    context = retrieval_pipeline(
+        query=body.query,
+        user_id=body.user_id,
+        subject=body.subject,
+        doc_id=body.doc_id,
+    )
     if not context:
-        return "I couldn't find anything relevant to that in the uploaded document."
-    full_message = f"Query: {query}\nSource Documents:\n{context}"
-    return final_response(model,full_message)
+        return "I couldn't find anything relevant to that in your documents."
+    full_message = f"Query: {body.query}\nSource Documents:\n{context}"
+    return final_response(model, full_message)
 
 
 # ---------- Endpoints ----------
 @app.post("/upload", status_code=202)
-def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    # One ingestion at a time: two at once would write into the same stores.
-    with state_lock:
-        if state["status"] == "processing":
-            raise HTTPException(409, "A document is still processing. Wait for it to finish.")
-        state["status"] = "processing"
-        state["error"] = None
+def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    subject: str = Form(...),
+    doc_id: Optional[str] = Form(None),
+):
+    doc_id = doc_id or str(uuid.uuid4())
+    doc_statuses[doc_id] = {"status": "processing", "error": None}
 
     try:
-        # Path(...).name strips any directories a client might put in the filename
-        file_path = UPLOAD_DIR / Path(file.filename).name
+        safe_name = f"{doc_id}_{Path(file.filename).name}"
+        file_path = UPLOAD_DIR / safe_name
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
-        state["status"] = "failed"
-        state["error"] = str(e)
+        doc_statuses[doc_id] = {"status": "failed", "error": str(e)}
         raise HTTPException(500, f"Could not save the upload: {e}")
 
-    background_tasks.add_task(ingest_pipeline, str(file_path))
-    return {"filepath": str(file_path), "status": state["status"]}
+    background_tasks.add_task(
+        ingest_pipeline, str(file_path), user_id, subject, doc_id
+    )
+    return {
+        "doc_id": doc_id,
+        "user_id": user_id,
+        "subject": subject,
+        "status": doc_statuses[doc_id]["status"],
+    }
 
 
-@app.get("/status")
-def get_status():
-    return state
+@app.get("/status/{doc_id}")
+def get_status(doc_id: str):
+    if doc_id not in doc_statuses:
+        raise HTTPException(404, f"Unknown doc_id: {doc_id}")
+    return {"doc_id": doc_id, **doc_statuses[doc_id]}
 
 
 @app.post("/ask")
 def ask(body: Question):
-    if state["status"] != "ready" or holder["retriever"] is None:
+    if body.doc_id and doc_statuses.get(body.doc_id, {}).get("status") == "processing":
         raise HTTPException(
             status_code=409,
-            detail=f"Document not ready (status: {state['status']}). Upload one and wait for 'ready'.",
+            detail=f"Document {body.doc_id} is still processing.",
         )
-    return {"answer": response_pipeline(body.query)}
+    return {"answer": response_pipeline(body)}
