@@ -1,72 +1,117 @@
+from typing import Optional
 from langsmith import traceable
-from llama_index.core import StorageContext, VectorStoreIndex
-from llama_index.core.llms import MockLLM
-from llama_index.core.retrievers import AutoMergingRetriever, QueryFusionRetriever
-from llama_index.retrievers.bm25 import BM25Retriever
+from collections import Counter
+from llama_index.core import VectorStoreIndex
+from llama_index.core.vector_stores import (
+    MetadataFilter,
+    MetadataFilters,
+    FilterOperator,
+)
 
-from ingestion.storage import BM25_DIR
 from config import Settings
+
 settings = Settings()
+TOP_K = settings.top_k
+MERGE_RATIO = getattr(settings, "merge_ratio", 0.5)
+MIN_MERGE_LEAVES = getattr(settings, "min_merge_leaves", 2)
 
-TOP_K = settings.top_k        # leaves fetched by EACH of dense and BM25, and kept after fusion
-MERGE_RATIO = settings.merge_ratio  # merge siblings into their parent when MORE than this fraction
-                    # of the parent's children were retrieved (see notes below)
+
+def build_metadata_filters(
+    user_id: str,
+    subject: Optional[str] = None,
+    doc_id: Optional[str] = None,
+) -> MetadataFilters:
+    """Build Qdrant payload filters for user_id, and optionally subject and doc_id."""
+    filters = [
+        MetadataFilter(key="user_id", value=user_id, operator=FilterOperator.EQ)
+    ]
+    if subject:
+        filters.append(
+            MetadataFilter(key="subject", value=subject, operator=FilterOperator.EQ)
+        )
+    if doc_id:
+        filters.append(
+            MetadataFilter(key="doc_id", value=doc_id, operator=FilterOperator.EQ)
+        )
+    return MetadataFilters(filters=filters)
 
 
-def build_hybrid_retriever(storage, embed_model):
+def build_hybrid_retriever(
+    storage,
+    embed_model,
+    user_id: str,
+    subject: Optional[str] = None,
+    doc_id: Optional[str] = None,
+):
     """
-    Search leaves first, then merge:
-      dense (Chroma) + BM25  ->  RRF fusion (top 50 leaves)
-      ->  auto-merge: leaves that share a parent are replaced by that parent,
-          every other leaf stays as a leaf.
+    Native Qdrant Hybrid Search:
+      1. Filters collection by user_id (+ optional subject / doc_id) in Qdrant payload.
+      2. Runs dense + sparse (BM25) search over 128-token leaves.
+      3. Fuses results natively in Qdrant via Reciprocal Rank Fusion (relative_score / RRF).
     """
-    docstore = storage.redis()
-    vector_store = storage.chroma()
-
-    # BM25 raises an error if top_k is larger than the number of indexed leaves
-    # (a short document can have fewer than 50), so cap k at the corpus size.
-    k = max(1, min(TOP_K, storage.chroma_collection().count()))
-
-    index = VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
-    dense = index.as_retriever(similarity_top_k=k)
-
-    sparse = BM25Retriever.from_persist_dir(BM25_DIR)
-    sparse.similarity_top_k = k
-
-    fusion = QueryFusionRetriever(
-        [dense, sparse],
-        similarity_top_k=k,
-        llm=MockLLM(),            # never called: num_queries=1 means no query rewriting
-        num_queries=1,
-        mode="reciprocal_rerank",  # RRF
-        use_async=False,
+    index = VectorStoreIndex.from_vector_store(
+        storage.vector_store(),
+        embed_model=embed_model,
     )
 
-    storage_context = StorageContext.from_defaults(
-        docstore=docstore, vector_store=vector_store
-    )
-    return AutoMergingRetriever(
-        fusion, storage_context, simple_ratio_thresh=MERGE_RATIO, verbose=False
+    filters = build_metadata_filters(user_id=user_id, subject=subject, doc_id=doc_id)
+
+    return index.as_retriever(
+        vector_store_query_mode="hybrid",
+        similarity_top_k=TOP_K,
+        sparse_top_k=TOP_K,
+        filters=filters,
     )
 
 
 @traceable(run_type="retriever")
-def drop_covered_nodes(results, docstore):
+def merge_leaves_to_parents(results) -> list[str]:
     """
-    Auto-merging can leave a leaf next to a bigger block that already contains it
-    (e.g. a 2048 block built from some 512 siblings, plus a leaf from another 512
-    sibling inside it). Drop any node whose ancestor is already in the results.
+    Stateless Auto-Merging via Qdrant Payload:
+      - Counts how many retrieved leaves share each `parent_id`.
+      - If a parent has >= MIN_MERGE_LEAVES retrieved (or exceeds MERGE_RATIO of its
+        total children), all of those leaves are replaced by a single `parent_text`
+        at the rank position of the highest-scoring leaf, and the rest are dropped.
+      - Otherwise, the individual 128-token leaf text is kept as-is.
     """
-    ids = {r.node.node_id for r in results}
-    kept = []
+    # 1. Count occurrences of each parent_id in the retrieved top-k leaves
+    parent_counts = Counter()
+    parent_total_children = {}
+
     for r in results:
-        cur, covered = r.node, False
-        while cur is not None and cur.parent_node is not None:
-            pid = cur.parent_node.node_id
-            if pid in ids:
-                covered = True
-                break
-            cur = docstore.get_document(pid, raise_error=False)
-        if not covered:
-            kept.append(r)
-    return kept
+        meta = r.node.metadata or {}
+        pid = meta.get("parent_id", r.node.node_id)
+        parent_counts[pid] += 1
+        # Default to 4 children (512 / 128) if older points don't have num_siblings yet
+        parent_total_children[pid] = meta.get("num_siblings", 4)
+
+    # 2. Decide which parents qualify for merging
+    parents_to_merge = set()
+    for pid, count in parent_counts.items():
+        total_children = max(1, parent_total_children[pid])
+        ratio = count / total_children
+
+        # Only merge if multiple leaves hit AND they exceed the ratio threshold
+        if count >= MIN_MERGE_LEAVES :
+            parents_to_merge.add(pid)
+
+    # 3. Build the final candidate list for the reranker (preserving RRF rank order)
+    merged_parent_ids = set()
+    candidate_texts = []
+
+    for r in results:
+        meta = r.node.metadata or {}
+        pid = meta.get("parent_id", r.node.node_id)
+
+        if pid in parents_to_merge:
+            # First time seeing a leaf from this qualified parent -> insert parent_text
+            if pid not in merged_parent_ids:
+                merged_parent_ids.add(pid)
+                parent_text = meta.get("parent_text") or r.node.get_content()
+                candidate_texts.append(parent_text)
+            # Subsequent sibling leaves from this parent are automatically dropped!
+        else:
+            # Did not meet merge threshold -> keep the 128-token leaf text
+            candidate_texts.append(r.node.get_content())
+
+    return candidate_texts

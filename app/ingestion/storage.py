@@ -1,38 +1,70 @@
-# ingestion/storage.py
-import chromadb
-
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.storage.docstore.redis import RedisDocumentStore
+import qdrant_client
+from qdrant_client.http import models as rest
+from llama_index.vector_stores.qdrant import QdrantVectorStore
 
 from config import Settings
 
 settings = Settings()
 
-# One place for every name/path, so ingestion, retrieval and reset can never disagree.
-CHROMA_PATH = settings.chroma_path
-CHROMA_COLLECTION = settings.chroma_collection
-BM25_DIR = settings.bm25_dir
-REDIS_NAMESPACE = settings.redis_namespace
+FILTERABLE_FIELDS = ("user_id", "subject", "doc_id", "parent_id")
 
 
 class Storage:
     def __init__(self):
-        # ONE Chroma client for the whole process (before, a new PersistentClient
-        # was created on every call to chroma()).
-        self.chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-        self._redis_stores = {}
+        # Single Qdrant client for the entire process
+        self.client = qdrant_client.QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+        )
+        self.collection_name = settings.qdrant_collection
+        self._vector_store = None
 
-    def chroma_collection(self):
-        return self.chroma_client.get_or_create_collection(CHROMA_COLLECTION)
-
-    def chroma(self):
-        # Always wrap a fresh get_or_create, so after a reset you never hold a
-        # wrapper pointing at a deleted collection.
-        return ChromaVectorStore(chroma_collection=self.chroma_collection())
-
-    def redis(self, namespace: str = REDIS_NAMESPACE):
-        if namespace not in self._redis_stores:
-            self._redis_stores[namespace] = RedisDocumentStore.from_host_and_port(
-                host="127.0.0.1", port=6379, namespace=namespace
+    def vector_store(self) -> QdrantVectorStore:
+        """
+        Returns a QdrantVectorStore configured for native hybrid search
+        (dense embeddings + sparse BM25/FastEmbed vectors).
+        """
+        if self._vector_store is None:
+            self._vector_store = QdrantVectorStore(
+                client=self.client,
+                collection_name=self.collection_name,
+                enable_hybrid=True,
+                fastembed_sparse_model=settings.sparse_model,
             )
-        return self._redis_stores[namespace]
+        return self._vector_store
+
+    def ensure_payload_indexes(self):
+        """
+        Create keyword payload indexes on multi-tenant filter fields.
+        Safe to call repeatedly after collection creation.
+        """
+        if not self.client.collection_exists(self.collection_name):
+            return
+
+        for field in FILTERABLE_FIELDS:
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name=field,
+                field_schema=rest.PayloadSchemaType.KEYWORD,
+            )
+
+    def count_points(self, doc_id: str | None = None) -> int:
+        """Count total points in collection, or points matching a specific doc_id."""
+        if not self.client.collection_exists(self.collection_name):
+            return 0
+
+        query_filter = None
+        if doc_id:
+            query_filter = rest.Filter(
+                must=[
+                    rest.FieldCondition(
+                        key="doc_id",
+                        match=rest.MatchValue(value=doc_id),
+                    )
+                ]
+            )
+        return self.client.count(
+            collection_name=self.collection_name,
+            count_filter=query_filter,
+            exact=True,
+        ).count
