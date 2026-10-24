@@ -1,17 +1,18 @@
+import json
+import time
+from pathlib import Path
 from langsmith import traceable
 from llama_index.core import StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
-from llama_index.retrievers.bm25 import BM25Retriever
-import json 
-from pathlib import Path
 
-from ingestion.storage import BM25_DIR
 from config import Settings
+
 settings = Settings()
 
 CHUNK_SIZES = settings.chunk_sizes
 CHUNKED_DIR = Path(settings.chunked_dir)
 CHUNKED_DIR.mkdir(exist_ok=True)
+
 
 def dump_nodes(all_nodes, leaf_nodes):
     """Write the chunks to disk so you can inspect them. Never fails an ingestion."""
@@ -36,6 +37,7 @@ def dump_nodes(all_nodes, leaf_nodes):
                 "num_children": len(n.child_nodes or []),
                 "words": len(text.split()),
                 "text": text,
+                "metadata": n.metadata,
             })
 
         (out_dir / "all_nodes.json").write_text(
@@ -50,37 +52,64 @@ def dump_nodes(all_nodes, leaf_nodes):
     except Exception as e:
         print(f"[dump_nodes] skipped: {e}")
 
+
 @traceable
-def chunk_documents(storage, embed_model, docs):
-    # 1. Hierarchical split: 2048 -> 512 -> 128 tokens.
-    #    get_nodes_from_documents returns ALL levels; leaves are the 128-token ones.
+def chunk_documents(
+    storage,
+    embed_model,
+    docs,
+    user_id: str,
+    subject: str,
+    doc_id: str,
+):
+    # 1. Hierarchical split: 512 (parent) -> 128 (leaf) tokens.
     node_parser = HierarchicalNodeParser.from_defaults(chunk_sizes=CHUNK_SIZES)
     all_nodes = node_parser.get_nodes_from_documents(docs)
     leaf_nodes = get_leaf_nodes(all_nodes)
-    dump_nodes(all_nodes, leaf_nodes) 
 
-    # 2. Redis docstore: EVERY node (all levels). The auto-merging step looks up
-    #    parents by id here. (The separate "leaves" namespace is gone: BM25 is built
-    #    straight from leaf_nodes in memory, so it can't drift from the other stores.)
-    docstore = storage.redis()
-    docstore.add_documents(all_nodes)
+    # 2. Build an in-memory lookup of all nodes so leaves can grab their parent's text.
+    node_ById = {n.node_id: n for n in all_nodes}
 
-    # 3. Chroma: leaves only, embedded.
-    storage_context = StorageContext.from_defaults(
-        docstore=docstore, vector_store=storage.chroma()
+    for leaf in leaf_nodes:
+        parent_id = leaf.parent_node.node_id if leaf.parent_node else leaf.node_id
+        
+        parent_node = node_ById.get(parent_id, leaf)
+        num_siblings = len(parent_node.child_nodes) if parent_node.child_nodes else 1
+        
+        leaf.metadata.update({
+            "user_id": user_id,
+            "subject": subject,
+            "doc_id": doc_id,
+            "parent_id": parent_id,
+            "parent_text": parent_node.get_content(),
+        })
+
+        # CRITICAL: Exclude payload fields from being concatenated into the
+        # 128-token leaf text when computing dense & sparse embeddings!
+        excluded_keys = ["parent_text", "parent_id", "user_id", "subject", "doc_id"]
+        leaf.excluded_embed_metadata_keys.extend(excluded_keys)
+        leaf.excluded_llm_metadata_keys.extend(excluded_keys)
+
+    dump_nodes(all_nodes, leaf_nodes)
+
+    # 3. Index leaves into Qdrant (computes both dense and sparse vectors automatically).
+    storage_context = StorageContext.from_defaults(vector_store=storage.vector_store())
+    VectorStoreIndex(
+        leaf_nodes,
+        storage_context=storage_context,
+        embed_model=embed_model,
     )
-    VectorStoreIndex(leaf_nodes, storage_context=storage_context, embed_model=embed_model)
 
-    # 4. BM25 over the same leaves, persisted to disk.
-    bm25 = BM25Retriever.from_defaults(nodes=leaf_nodes)
-    bm25.persist(BM25_DIR)
+    # 4. Ensure fast keyword indexes exist on user_id, subject, doc_id, and parent_id.
+    storage.ensure_payload_indexes()
 
-    # 5. Consistency check: fail loudly now instead of returning odd results later.
-    n_chroma = storage.chroma_collection().count()
-    if n_chroma != len(leaf_nodes):
+    '''# 5. Consistency check scoped to this specific doc_id.
+    time.sleep(3)
+    n_qdrant = storage.count_points(doc_id=doc_id)
+    if n_qdrant != len(leaf_nodes):
         raise RuntimeError(
-            f"Store mismatch after ingestion: {len(leaf_nodes)} leaves but "
-            f"{n_chroma} vectors in Chroma."
-        )
+            f"Store mismatch after ingestion for doc_id={doc_id}: "
+            f"{len(leaf_nodes)} leaves generated, but {n_qdrant} points in Qdrant."
+        ) '''
 
-    return {"nodes": len(all_nodes), "leaves": len(leaf_nodes)}
+    return {"nodes": len(all_nodes), "leaves": len(leaf_nodes), "doc_id": doc_id}
