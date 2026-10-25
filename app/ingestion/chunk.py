@@ -10,47 +10,6 @@ from config import Settings
 settings = Settings()
 
 CHUNK_SIZES = settings.chunk_sizes
-CHUNKED_DIR = Path(settings.chunked_dir)
-CHUNKED_DIR.mkdir(exist_ok=True)
-
-
-def dump_nodes(all_nodes, leaf_nodes):
-    """Write the chunks to disk so you can inspect them. Never fails an ingestion."""
-    try:
-        out_dir = Path(settings.chunked_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        leaf_ids = {n.node_id for n in leaf_nodes}
-
-        records = []
-        for n in all_nodes:
-            if n.node_id in leaf_ids:
-                level = "leaf"
-            elif n.parent_node is None:
-                level = "root"
-            else:
-                level = "mid"
-            text = n.get_content()
-            records.append({
-                "id": n.node_id,
-                "level": level,
-                "parent_id": n.parent_node.node_id if n.parent_node else None,
-                "num_children": len(n.child_nodes or []),
-                "words": len(text.split()),
-                "text": text,
-                "metadata": n.metadata,
-            })
-
-        (out_dir / "all_nodes.json").write_text(
-            json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-
-        blocks = [
-            f"=== {r['level']} | id {r['id'][:8]} | parent {str(r['parent_id'])[:8]} | {r['words']} words ===\n{r['text']}"
-            for r in records if r["level"] == "leaf"
-        ]
-        (out_dir / "leaves.md").write_text("\n\n".join(blocks), encoding="utf-8")
-    except Exception as e:
-        print(f"[dump_nodes] skipped: {e}")
 
 
 @traceable
@@ -90,7 +49,6 @@ def chunk_documents(
         leaf.excluded_embed_metadata_keys.extend(excluded_keys)
         leaf.excluded_llm_metadata_keys.extend(excluded_keys)
 
-    dump_nodes(all_nodes, leaf_nodes)
 
     # 3. Index leaves into Qdrant (computes both dense and sparse vectors automatically).
     storage_context = StorageContext.from_defaults(vector_store=storage.vector_store())
