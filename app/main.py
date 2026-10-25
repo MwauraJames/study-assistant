@@ -35,9 +35,6 @@ mongo = MongoStore()         # MongoDB (Raw PDFs, Parsed Docs, Chat History)
 embed_model = Embed().get_embedding()
 client = LlamaCloud()
 
-UPLOAD_DIR = Path(settings.upload_dir)
-UPLOAD_DIR.mkdir(exist_ok=True)
-
 
 class Question(BaseModel):
     query: str
@@ -181,9 +178,6 @@ async def upload_file(
             content_type=file.content_type or "application/pdf",
         )
 
-        # 2. Write local working copy for the PDF parser
-        file_path = UPLOAD_DIR / f"{doc_id}_{clean_name}"
-        file_path.write_bytes(raw_bytes)
     except Exception as e:
         raise HTTPException(500, f"Could not save upload: {e}")
 
