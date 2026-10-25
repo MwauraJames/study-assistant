@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -11,6 +12,8 @@ app = FastAPI()
 
 # doc_id -> {user_id, subject, status, error, filename}
 documents: dict[str, dict] = {}
+chats: dict[str, dict] = {}
+messages: dict[str, list[dict]] = {}
 
 
 class Question(BaseModel):
@@ -18,6 +21,11 @@ class Question(BaseModel):
     user_id: str
     subject: Optional[str] = None
     doc_id: Optional[str] = None
+    chat_id: Optional[str] = None
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _finish_upload(doc_id: str, filename: str) -> None:
@@ -97,6 +105,42 @@ def ask(body: Question):
         doc for doc_id, doc in documents.items() if matches(doc, doc_id)
     ]
     if not matching:
-        return {"answer": "nothing found"}
-    subject = body.subject or matching[0]["subject"]
-    return {"answer": f"Here is what I found for {subject}. 【source】"}
+        answer = "nothing found"
+    else:
+        subject = body.subject or matching[0]["subject"]
+        answer = f"Here is what I found for {subject}. 【source】"
+
+    chat_id = body.chat_id or str(uuid.uuid4())
+    now = _now()
+    if chat_id not in chats:
+        chats[chat_id] = {
+            "chat_id": chat_id,
+            "user_id": body.user_id,
+            "subject": body.subject,
+            "title": (body.query or "")[:60],
+            "created_at": now,
+            "updated_at": now,
+        }
+        messages[chat_id] = []
+    chats[chat_id]["updated_at"] = now
+    messages[chat_id].append({"role": "user", "content": body.query, "created_at": now})
+    messages[chat_id].append({"role": "assistant", "content": answer, "created_at": now})
+    return {"chat_id": chat_id, "answer": answer}
+
+
+@app.get("/chats/{chat_id}/messages")
+def get_chat_history(chat_id: str):
+    return {"chat_id": chat_id, "messages": messages.get(chat_id, [])}
+
+
+@app.get("/chats/{user_id}")
+def get_user_chats(user_id: str, subject: Optional[str] = None):
+    found = []
+    for chat in chats.values():
+        if chat["user_id"] != user_id:
+            continue
+        if subject is not None and chat.get("subject") != subject:
+            continue
+        found.append(chat)
+    found.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    return {"chats": found}

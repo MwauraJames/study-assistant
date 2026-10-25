@@ -44,7 +44,16 @@ class StatusResult:
 @dataclass
 class AskResult:
     answer: str
+    chat_id: str | None = None
     sources: list[Any] | None = field(default=None)
+
+
+@dataclass
+class ChatSummary:
+    chat_id: str
+    title: str
+    subject: str | None = None
+    updated_at: Any = None
 
 
 def _friendly_http_error(response: requests.Response, *, for_status: bool = False) -> ApiError:
@@ -130,12 +139,20 @@ def get_status(doc_id: str) -> StatusResult:
     )
 
 
-def ask(query: str, user_id: str, subject: str, doc_id: str | None = None) -> AskResult:
+def ask(
+    query: str,
+    user_id: str,
+    subject: str,
+    doc_id: str | None = None,
+    chat_id: str | None = None,
+) -> AskResult:
     if not subject:
         raise ApiError("A subject is required.")
     payload: dict[str, Any] = {"query": query, "user_id": user_id, "subject": subject}
     if doc_id:
         payload["doc_id"] = doc_id
+    if chat_id:
+        payload["chat_id"] = chat_id
 
     def _do() -> requests.Response:
         return _session.post(
@@ -154,7 +171,72 @@ def ask(query: str, user_id: str, subject: str, doc_id: str | None = None) -> As
     sources = body.get("sources")
     if not sources:
         sources = None
-    return AskResult(answer=body.get("answer") or "", sources=sources)
+    return AskResult(
+        answer=body.get("answer") or "",
+        chat_id=body.get("chat_id") or chat_id,
+        sources=sources,
+    )
+
+
+def list_chats(user_id: str, subject: str | None = None) -> list[ChatSummary]:
+    params: dict[str, str] = {}
+    if subject:
+        params["subject"] = subject
+
+    def _do() -> requests.Response:
+        return _session.get(
+            f"{API_URL}/chats/{user_id}",
+            params=params or None,
+            timeout=(CONNECT_TIMEOUT, STATUS_READ_TIMEOUT),
+        )
+
+    try:
+        response = _once_or_retry(_do, retry_connection=True)
+    except Exception as exc:
+        raise _map_request_error(exc) from exc
+    if response.status_code >= 400:
+        raise _friendly_http_error(response)
+    payload = response.json()
+    chats = payload.get("chats") or []
+    result: list[ChatSummary] = []
+    for chat in chats:
+        chat_id = chat.get("chat_id")
+        if not chat_id:
+            continue
+        result.append(
+            ChatSummary(
+                chat_id=chat_id,
+                title=chat.get("title") or "New Study Session",
+                subject=chat.get("subject"),
+                updated_at=chat.get("updated_at"),
+            )
+        )
+    return result
+
+
+def get_chat_messages(chat_id: str) -> list[dict[str, Any]]:
+    def _do() -> requests.Response:
+        return _session.get(
+            f"{API_URL}/chats/{chat_id}/messages",
+            timeout=(CONNECT_TIMEOUT, STATUS_READ_TIMEOUT),
+        )
+
+    try:
+        response = _once_or_retry(_do, retry_connection=True)
+    except Exception as exc:
+        raise _map_request_error(exc) from exc
+    if response.status_code >= 400:
+        raise _friendly_http_error(response)
+    payload = response.json()
+    messages = payload.get("messages") or []
+    cleaned: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role not in {"user", "assistant"} or content is None:
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned
 
 
 def ping() -> bool:

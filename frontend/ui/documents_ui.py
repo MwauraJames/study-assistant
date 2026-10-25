@@ -11,7 +11,7 @@ from core.config import MAX_UPLOAD_MB, POLL_SECONDS
 from core.db import new_id
 from core.text_utils import format_size, safe_filename
 
-ACCEPTED = ["pdf", "docx", "pptx", "txt", "md"]
+ACCEPTED = ["pdf", "docx", "pptx", "txt", "md","doc"]
 LONG_PROCESSING_MINUTES = 15
 UNKNOWN_TOOLTIP = "The server no longer knows this document. It may need to be uploaded again."
 

@@ -4,7 +4,7 @@ import pytest
 import requests
 
 from core import api_client
-from core.api_client import ApiError, AskResult
+from core.api_client import ApiError, AskResult, ChatSummary
 
 
 def _response(status_code: int, payload: dict | None = None, url: str = "http://localhost:8000/x") -> Mock:
@@ -29,6 +29,7 @@ def test_ask_always_sends_subject(monkeypatch):
     assert captured["json"]["subject"] == "physics"
     assert captured["json"]["user_id"] == "user-1"
     assert "subject" in captured["json"]
+    assert "chat_id" not in captured["json"]
 
 
 def test_ask_requires_subject():
@@ -115,3 +116,49 @@ def test_ask_keeps_sources(monkeypatch):
     )
     result = api_client.ask("q", "u", "physics")
     assert result.sources == ["notes.pdf"]
+
+
+def test_ask_sends_chat_id_and_returns_it(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return _response(200, {"answer": "ok", "chat_id": "chat-123"})
+
+    monkeypatch.setattr(api_client._session, "post", fake_post)
+    result = api_client.ask("follow up", "user-1", "physics", chat_id="chat-123")
+    assert captured["json"]["chat_id"] == "chat-123"
+    assert result.chat_id == "chat-123"
+
+
+def test_list_chats_and_messages(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        if url.endswith("/chats/user-1"):
+            assert params == {"subject": "physics"}
+            return _response(
+                200,
+                {
+                    "chats": [
+                        {"chat_id": "c1", "title": "Newton", "subject": "physics"},
+                    ]
+                },
+            )
+        return _response(
+            200,
+            {
+                "chat_id": "c1",
+                "messages": [
+                    {"role": "user", "content": "What is force?"},
+                    {"role": "assistant", "content": "A push or pull."},
+                ],
+            },
+        )
+
+    monkeypatch.setattr(api_client._session, "get", fake_get)
+    chats = api_client.list_chats("user-1", "physics")
+    assert chats == [
+        ChatSummary(chat_id="c1", title="Newton", subject="physics", updated_at=None)
+    ]
+    messages = api_client.get_chat_messages("c1")
+    assert messages[0]["role"] == "user"
+    assert messages[1]["content"] == "A push or pull."

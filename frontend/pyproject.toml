@@ -8,6 +8,7 @@ dependencies = [
     "requests",
     "bcrypt",
     "python-dotenv",
+    "pymongo>=4.19.0",
 ]
 
 [dependency-groups]
