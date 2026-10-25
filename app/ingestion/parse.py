@@ -5,8 +5,6 @@ from config import Settings
 
 settings = Settings()
 
-PARSED_DIR = Path(settings.parsed_dir)
-PARSED_DIR.mkdir(exist_ok=True)
 
 @traceable
 def parse_document(client, file_path):
@@ -27,7 +25,5 @@ def parse_document(client, file_path):
         raise ValueError("Parsing returned no text.")
     
     text = "\n\n".join(pages)
-    out = PARSED_DIR / f"{Path(file_path).stem}.md"
-    out.write_text(text, encoding="utf-8")
     
     return text
