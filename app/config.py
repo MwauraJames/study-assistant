@@ -9,10 +9,6 @@ class Settings(BaseSettings):
     min_merge_leaves: int = 3
     chunk_sizes: list[int] = [512, 128]
 
-    chunked_dir: str = "chunked_content"
-    parsed_dir: str = "parsed_content"
-    upload_dir: str = "uploads"
-
     # Qdrant Configuration (defaults to local Docker/server instance; can also use path="./qdrant_storage")
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: Optional[str] = None
