@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     qdrant_collection: str = "university_nodes"
     sparse_model: str = "Qdrant/bm25"
 
+    mongo_uri: str = "mongodb://localhost:27017"
+    mongo_db_name: str = "study_assistant"
+    chat_history_limit: int = 6
+
     temparature: float = 0.2
 
     rerank_model: str = "rerank-v4.0-pro"
