@@ -1,4 +1,3 @@
-import shutil
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -10,19 +9,20 @@ from fastapi import FastAPI, File, Form, UploadFile, BackgroundTasks, HTTPExcept
 from pydantic import BaseModel
 
 from llama_index.core import Document
-from llama_cloud import LlamaCloud
 from langsmith import traceable
+from llama_cloud import LlamaCloud
 
 from ingestion.parse import parse_document
 from ingestion.chunk import chunk_documents
 from ingestion.storage import Storage
+from ingestion.mongo_store import MongoStore
 from ingestion.embed import Embed
-from ingestion.reset_store import delete_by_doc_id
+from ingestion.reset_store import delete_by_doc_id, reset_all
 from retrieval.reranker import rerank_documents
 from retrieval.expand import expand_query
+from retrieval.hybrid_search import build_hybrid_retriever, merge_leaves_to_parents
 from generation.response import final_response
 from models import model
-from retrieval.hybrid_search import build_hybrid_retriever, merge_leaves_to_parents
 from config import Settings
 
 
@@ -30,15 +30,13 @@ from config import Settings
 app = FastAPI()
 
 settings = Settings()
-storage = Storage()
+storage = Storage()          # Qdrant (Vectors + Hybrid Search)
+mongo = MongoStore()         # MongoDB (Raw PDFs, Parsed Docs, Chat History)
 embed_model = Embed().get_embedding()
 client = LlamaCloud()
 
 UPLOAD_DIR = Path(settings.upload_dir)
 UPLOAD_DIR.mkdir(exist_ok=True)
-
-# Track ingestion status per doc_id instead of blocking the entire server
-doc_statuses: dict[str, dict] = {}
 
 
 class Question(BaseModel):
@@ -46,18 +44,28 @@ class Question(BaseModel):
     user_id: str
     subject: Optional[str] = None
     doc_id: Optional[str] = None
+    chat_id: Optional[str] = None  # Pass existing chat_id to continue a conversation
+
+
+def format_history(messages: list[dict]) -> str:
+    """Format MongoDB message records into a clean transcript for the LLM."""
+    if not messages:
+        return "No prior conversation."
+    return "\n".join(
+        f"{m['role'].upper()}: {m['content']}" for m in messages
+    )
 
 
 # ---------- Pipelines ----------
 @traceable(name="ingest_pipeline", run_type="chain")
 def ingest_pipeline(file_path: str, user_id: str, subject: str, doc_id: str):
     try:
-        parsed_content = parse_document(client, file_path)
+        # 1. Parse PDF into Markdown locally
+        parsed_content = parse_document(client , file_path)
 
-        # If re-uploading the same doc_id, clear only its old points first
+        # 2. Clear any old Qdrant points for this doc_id and index new chunks
         delete_by_doc_id(storage, doc_id)
-
-        chunk_documents(
+        stats = chunk_documents(
             storage=storage,
             embed_model=embed_model,
             docs=[Document(text=parsed_content)],
@@ -65,11 +73,17 @@ def ingest_pipeline(file_path: str, user_id: str, subject: str, doc_id: str):
             subject=subject,
             doc_id=doc_id,
         )
-        doc_statuses[doc_id] = {"status": "ready", "error": None}
+
+        # 3. Persist the full parsed Markdown and 'ready' status in MongoDB
+        mongo.save_parsed_document(
+            doc_id=doc_id,
+            parsed_markdown=parsed_content,
+            num_leaves=stats["leaves"],
+        )
     except Exception as e:
-        doc_statuses[doc_id] = {"status": "failed", "error": str(e)}
+        mongo.mark_document_failed(doc_id, str(e))
         try:
-            delete_by_doc_id(storage, doc_id)  # Clean up partial writes for this doc_id
+            delete_by_doc_id(storage, doc_id)
         except Exception:
             pass
         raise
@@ -78,14 +92,15 @@ def ingest_pipeline(file_path: str, user_id: str, subject: str, doc_id: str):
 @traceable(name="retrieval_pipeline", run_type="chain")
 def retrieval_pipeline(
     query: str,
+    chat_history: list[dict],
     user_id: str,
     subject: Optional[str] = None,
     doc_id: Optional[str] = None,
 ) -> str:
-    # 1. Expand the question
-    expanded_query = expand_query(model, query)
+    # 1. Contextualize + expand the query using recent chat history
+    expanded_query = expand_query(model, query, chat_history=chat_history)
 
-    # 2. Build filtered Qdrant hybrid retriever and retrieve top-k 128-token leaves
+    # 2. Retrieve top-k 128-token leaves from Qdrant (dense + sparse RRF)
     retriever = build_hybrid_retriever(
         storage=storage,
         embed_model=embed_model,
@@ -97,52 +112,80 @@ def retrieval_pipeline(
     if not leaf_results:
         return ""
 
-    # 3. Promote leaves to their unique 512-token parent texts from Qdrant payload
+    # 3. Auto-merge sibling leaves into 512-token parents when threshold is met
     candidate_texts = merge_leaves_to_parents(leaf_results)
     if not candidate_texts:
-        return "" 
+        return ""
 
-    # 4. Rerank unique parent blocks against the original question
-    reranked = rerank_documents(query, candidate_texts)
+    # 4. Rerank against the expanded/contextualized query so pronouns don't confuse the reranker!
+    reranked = rerank_documents(expanded_query, candidate_texts)
     best = [candidate_texts[r.index] for r in reranked.results]
 
     return "\n\n---\n\n".join(best)
 
 
 @traceable(name="response_pipeline", run_type="chain")
-def response_pipeline(body: Question) -> str:
+def response_pipeline(body: Question, chat_id: str) -> str:
+    # 1. Fetch past messages for this chat_id from MongoDB
+    past_messages = mongo.get_recent_messages(chat_id)
+
+    # 2. Retrieve relevant chunks from Qdrant
     context = retrieval_pipeline(
         query=body.query,
+        chat_history=past_messages,
         user_id=body.user_id,
         subject=body.subject,
         doc_id=body.doc_id,
     )
+
     if not context:
-        return "I couldn't find anything relevant to that in your documents."
-    full_message = f"Query: {body.query}\nSource Documents:\n{context}"
-    return final_response(model, full_message)
+        answer = "I couldn't find anything relevant to that in your documents."
+    else:
+        answer = final_response(
+            model=model,
+            query=body.query,
+            context=context,
+            chat_history=past_messages,
+        )
+
+    # 3. Save this turn (user question + assistant answer) in MongoDB
+    mongo.add_message(chat_id, body.user_id, "user", body.query)
+    mongo.add_message(chat_id, body.user_id, "assistant", answer)
+
+    return answer
 
 
 # ---------- Endpoints ----------
 @app.post("/upload", status_code=202)
-def upload_file(
+async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user_id: str = Form(...),
     subject: str = Form(...),
-    doc_id: Optional[str] = Form(None),
+    doc_id: Optional[str] = Form(None),  # frontend already posts this
 ):
-    doc_id = doc_id or str(uuid.uuid4())
-    doc_statuses[doc_id] = {"status": "processing", "error": None}
-
+    clean_name = Path(file.filename).name
+    if not doc_id:
+        doc_id = f"{user_id}_{subject}_{clean_name}"
+    # ... create_document_record / ingest with this doc_id ...
     try:
-        safe_name = f"{doc_id}_{Path(file.filename).name}"
-        file_path = UPLOAD_DIR / safe_name
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        raw_bytes = await file.read()
+
+        # 1. Store unprocessed binary in MongoDB GridFS + initialize status
+        mongo.create_document_record(
+            doc_id=doc_id,
+            user_id=user_id,
+            subject=subject,
+            filename=clean_name,
+            raw_bytes=raw_bytes,
+            content_type=file.content_type or "application/pdf",
+        )
+
+        # 2. Write local working copy for the PDF parser
+        file_path = UPLOAD_DIR / f"{doc_id}_{clean_name}"
+        file_path.write_bytes(raw_bytes)
     except Exception as e:
-        doc_statuses[doc_id] = {"status": "failed", "error": str(e)}
-        raise HTTPException(500, f"Could not save the upload: {e}")
+        raise HTTPException(500, f"Could not save upload: {e}")
 
     background_tasks.add_task(
         ingest_pipeline, str(file_path), user_id, subject, doc_id
@@ -151,22 +194,54 @@ def upload_file(
         "doc_id": doc_id,
         "user_id": user_id,
         "subject": subject,
-        "status": doc_statuses[doc_id]["status"],
+        "status": "processing",
     }
 
 
 @app.get("/status/{doc_id}")
 def get_status(doc_id: str):
-    if doc_id not in doc_statuses:
+    record = mongo.get_document_status(doc_id)
+    if not record:
         raise HTTPException(404, f"Unknown doc_id: {doc_id}")
-    return {"doc_id": doc_id, **doc_statuses[doc_id]}
+    return record
 
 
 @app.post("/ask")
 def ask(body: Question):
-    if body.doc_id and doc_statuses.get(body.doc_id, {}).get("status") == "processing":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Document {body.doc_id} is still processing.",
-        )
-    return {"answer": response_pipeline(body)}
+    # Clean out Swagger UI default "string" placeholders if present
+    doc_id = None if body.doc_id in (None, "", "string") else body.doc_id
+    subject = None if body.subject in (None, "", "string") else body.subject
+    chat_id = (
+        str(uuid.uuid4())
+        if body.chat_id in (None, "", "string")
+        else body.chat_id
+    )
+
+    body.doc_id = doc_id
+    body.subject = subject
+
+    # Ensure the chat session exists in MongoDB
+    mongo.ensure_chat_session(
+        chat_id=chat_id,
+        user_id=body.user_id,
+        subject=subject,
+        title=body.query[:60],
+    )
+
+    answer = response_pipeline(body, chat_id=chat_id)
+    return {
+        "chat_id": chat_id,
+        "answer": answer,
+    }
+
+
+@app.get("/chats/{user_id}")
+def get_user_chats(user_id: str, subject: Optional[str] = None):
+    """List all chat sessions for a user (and optional subject)."""
+    return {"chats": mongo.list_user_chats(user_id, subject)}
+
+
+@app.get("/chats/{chat_id}/messages")
+def get_chat_history(chat_id: str):
+    """Retrieve the message history for a specific chat session."""
+    return {"chat_id": chat_id, "messages": mongo.get_recent_messages(chat_id, limit=100)}
